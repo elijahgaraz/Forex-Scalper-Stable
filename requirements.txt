@@ -1,0 +1,13 @@
+# Requirements for the forex_scalper application
+
+# For cTrader Open API using spotware/OpenApiPy
+# This will pull in Twisted and protobuf
+ctrader-open-api
+
+# requests might still be needed if there's an initial HTTP OAuth step
+# not handled by OpenApiPy's primary examples (e.g. to get client_id/secret
+# or an initial access token for a different flow).
+# For now, let's keep it, can remove later if truly unused.
+requests
+
+# tkinter for the GUI is part of the standard library.

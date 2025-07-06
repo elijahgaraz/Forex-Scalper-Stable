@@ -1,0 +1,15 @@
+{
+    "openapi": {
+        "client_id": "15886_xUe3eDmCM7SbtROO2Z2HDuIyNGeafQWuo7OKb1BN5BeOcI8vEP",
+        "client_secret": "5nT43rQRm9IbUv1ELUbymjyTxbfIcsGECULNysuHrrJWji2zvz",
+        "host_type": "live",
+        "default_ctid_trader_account_id": 6077021,
+        "spotware_auth_url": "https://connect.spotware.com/oauth/v2/auth",
+        "spotware_token_url": "https://connect.spotware.com/oauth/v2/token",
+        "redirect_uri": "http://localhost:5000/callback"
+    },
+    "general": {
+        "default_symbol": "GBP/USD",
+        "chart_update_interval_ms": 500
+    }
+}
