@@ -9,6 +9,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 # import socketserver # Not directly used with basic HTTPServer in a thread
 import queue
+import sys
+import traceback
 
 # Conditional import for Twisted reactor for GUI integration
 _reactor_installed = False
@@ -65,7 +67,7 @@ import json # For token persistence
 
 # Imports from ctrader-open-api
 try:
-    from ctrader_open_api import Client, TcpProtocol, EndPoints
+    from ctrader_open_api import Client, TcpProtocol, EndPoints, Protobuf
     from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
         ProtoHeartbeatEvent,
         ProtoErrorRes,
@@ -83,9 +85,11 @@ try:
         ProtoOAErrorRes,
         # Specific message types for deserialization
         ProtoOAGetCtidProfileByTokenRes,
-        ProtoOAGetCtidProfileByTokenReq
+        ProtoOAGetCtidProfileByTokenReq,
+        ProtoOASymbolByNameReq, ProtoOASymbolByNameRes, ProtoOASymbol, # For symbol details
+        ProtoOASubscribeSpotsReq, ProtoOASubscribeSpotsRes # For spot subscription
     )
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrader
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrader, ProtoOASymbol
     USE_OPENAPI_LIB = True
 except ImportError as e:
     print(f"ctrader-open-api import failed ({e}); running in mock mode.")
@@ -117,15 +121,23 @@ class Trader:
 
         # Account details
         self.ctid_trader_account_id: Optional[int] = settings.openapi.default_ctid_trader_account_id
-        self.account_id: Optional[str] = None
+        self.account_id: Optional[str] = None # Will be string representation of ctidTraderAccountId
         self.balance: Optional[float] = None
         self.equity: Optional[float] = None
         self.currency: Optional[str] = None
+        self.used_margin: Optional[float] = None # For margin used
+
+        # For live prices
+        self.latest_symbol_prices: Dict[int, Dict[str, float]] = {} # Keyed by symbolId: {'bid': bid, 'ask': ask}
+        self.symbol_details_cache: Dict[int, Dict[str, Any]] = {}   # Keyed by symbolId: {'digits': 5, 'name': 'EURUSD', ...}
+        self.symbol_name_to_id_map: Dict[str, int] = {}            # Keyed by symbolName (e.g. "EURUSD"): symbolId
+        self.price_update_callback: Optional[callable] = None      # Callback for GUI updates on new price
 
         self._client: Optional[Client] = None
         self._message_id_counter: int = 1
         self._reactor_thread: Optional[threading.Thread] = None
         self._auth_code: Optional[str] = None # To store the auth code from OAuth flow
+        self._account_auth_initiated: bool = False # Flag to prevent duplicate account auth attempts
 
         if USE_OPENAPI_LIB:
             host = (
@@ -183,34 +195,6 @@ class Trader:
             except OSError as rm_err:
                 print(f"Error removing corrupted token file: {rm_err}")
 
-
-    def _load_tokens_from_file(self):
-        """
-        Loads OAuth access token, refresh token, and expiry time from TOKEN_FILE_PATH.
-        Sets the corresponding instance attributes if tokens are found and loaded.
-        """
-        try:
-            with open(TOKEN_FILE_PATH, "r") as f:
-                tokens = json.load(f)
-            self._access_token = tokens.get("access_token")
-            self._refresh_token = tokens.get("refresh_token")
-            self._token_expires_at = tokens.get("token_expires_at")
-            if self._access_token:
-                print(f"Tokens loaded from {TOKEN_FILE_PATH}. Access token: {self._access_token[:20]}...")
-            else:
-                print(f"{TOKEN_FILE_PATH} not found or no access token in it. Will need OAuth.")
-        except FileNotFoundError:
-            print(f"Token file {TOKEN_FILE_PATH} not found. New OAuth flow will be required.")
-        except (IOError, json.JSONDecodeError) as e:
-            print(f"Error loading tokens from {TOKEN_FILE_PATH}: {e}. Will need OAuth flow.")
-            # In case of corrupted file, good to try to remove it or back it up
-            try:
-                import os
-                os.remove(TOKEN_FILE_PATH) # Ensure os is imported if this is the only place
-                print(f"Removed corrupted token file: {TOKEN_FILE_PATH}")
-            except OSError as rm_err:
-                print(f"Error removing corrupted token file: {rm_err}")
-
     def _next_message_id(self) -> str:
         mid = str(self._message_id_counter)
         self._message_id_counter += 1
@@ -228,7 +212,7 @@ class Trader:
             print("Missing OpenAPI credentials.")
             client.stopService()
             return
-        print("Sending ApplicationAuth request.")
+        print(f"Sending ProtoOAApplicationAuthReq: {req}")
         d = client.send(req)
         d.addCallbacks(self._handle_app_auth_response, self._handle_send_error)
 
@@ -236,63 +220,38 @@ class Trader:
         print(f"OpenAPI Client Disconnected: {reason}")
         self.is_connected = False
         self._is_client_connected = False
+        self._account_auth_initiated = False # Reset flag
 
     def _on_message_received(self, client: Client, message: Any) -> None:
-        print(f"_on_message_received: Outer message type: {type(message)}")
+        print(f"Original message received (type: {type(message)}): {message}")
 
-        actual_message = message
-        payload_type = 0 # Default for non-ProtoMessage or if extraction fails
+        # Attempt to extract and deserialize using Protobuf.extract
+        try:
+            actual_message = Protobuf.extract(message)
+            print(f"Message extracted via Protobuf.extract (type: {type(actual_message)}): {actual_message}")
+        except Exception as e:
+            print(f"Error using Protobuf.extract: {e}. Falling back to manual deserialization if possible.")
+            actual_message = message # Fallback to original message for manual processing attempt
+            # Log additional details about the original message if it's a ProtoMessage
+            if isinstance(message, ProtoMessage):
+                 print(f"  Fallback: Original ProtoMessage PayloadType: {message.payloadType}, Payload Bytes: {message.payload[:64]}...") # Log first 64 bytes
 
-        if isinstance(message, ProtoMessage):
+        # If Protobuf.extract returned the original ProtoMessage wrapper, it means it couldn't deserialize it.
+        # Or if an error occurred and we fell back.
+        # We can attempt manual deserialization as before, but it's better if Protobuf.extract handles it.
+        # For now, the dispatch logic below will use the result of Protobuf.extract.
+        # If actual_message is still ProtoMessage, the specific isinstance checks will fail,
+        # which is the correct behavior if it couldn't be properly deserialized.
+
+        # We need to get payload_type for logging in case it's an unhandled ProtoMessage
+        payload_type = 0
+        if isinstance(actual_message, ProtoMessage): # If still a wrapper after extract attempt
+            payload_type = actual_message.payloadType
+            print(f"  Protobuf.extract did not fully deserialize. Message is still ProtoMessage wrapper with PayloadType: {payload_type}")
+        elif isinstance(message, ProtoMessage) and actual_message is message: # Fallback case where actual_message was reset to original
             payload_type = message.payloadType
-            payload_bytes = message.payload
-            print(f"  It's a ProtoMessage wrapper. PayloadType: {payload_type}, Payload an_instance_of bytes: {isinstance(payload_bytes, bytes)}")
-
-            # Deserialize based on payloadType using ProtoOAPayloadType from OpenApiMessages_pb2
-            if payload_type == ProtoOAPayloadType.OA_APPLICATION_AUTH_RES: # 2101
-                actual_message = ProtoOAApplicationAuthRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_ACCOUNT_AUTH_RES: # 2103
-                actual_message = ProtoOAAccountAuthRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_GET_CTID_PROFILE_BY_TOKEN_RES: # 2142
-                actual_message = ProtoOAGetCtidProfileByTokenRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES: # 2135
-                actual_message = ProtoOAGetAccountListByAccessTokenRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_TRADER_RES: # 2120
-                 actual_message = ProtoOATraderRes()
-                 actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_TRADER_UPDATE_EVENT: # 2126
-                 actual_message = ProtoOATraderUpdatedEvent()
-                 actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_SPOT_EVENT: # 2128
-                actual_message = ProtoOASpotEvent()
-                actual_message.ParseFromString(payload_bytes)
-            # elif payload_type == ProtoOAPayloadType.OA_EXECUTION_EVENT: # 2127
-            #     actual_message = ProtoOAExecutionEvent()
-            #     actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.OA_ERROR_RES: # 2105
-                actual_message = ProtoOAErrorRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.ERROR_RES: # 50 (common error from OpenApiCommonMessages_pb2.ProtoPayloadType)
-                                                              # This specific one might need care if ProtoOAPayloadType doesn't include it
-                                                              # However, ERROR_RES (50) and HEARTBEAT_EVENT (51) are typically in a common payload enum.
-                                                              # If ProtoOAPayloadType is specific to OA_ messages, this check might be problematic.
-                                                              # For now, assuming ProtoOAPayloadType includes these common types too, or they won't be hit often here.
-                actual_message = ProtoErrorRes()
-                actual_message.ParseFromString(payload_bytes)
-            elif payload_type == ProtoOAPayloadType.HEARTBEAT_EVENT: # 51
-                actual_message = ProtoHeartbeatEvent()
-                actual_message.ParseFromString(payload_bytes)
-            else:
-                print(f"  No specific deserializer for PayloadType: {payload_type}. Dispatch will use original wrapper or fail on type.")
-                # actual_message remains the original ProtoMessage; subsequent isinstance checks will fail for specific types
-                # This is important: if we don't deserialize, it won't match specific handlers.
-
-        if actual_message is not message : # Log if deserialization happened
-             print(f"  Deserialized to: {type(actual_message)}")
+        # Ensure payload_type is defined for the final log message if it's an unhandled ProtoMessage
+        final_payload_type_for_log = payload_type if isinstance(actual_message, ProtoMessage) else getattr(actual_message, 'payloadType', 'N/A')
 
 
         # Dispatch by type using the (potentially deserialized) actual_message
@@ -308,6 +267,19 @@ class Trader:
         elif isinstance(actual_message, ProtoOAGetAccountListByAccessTokenRes):
             print("  Dispatching to _handle_get_account_list_response")
             self._handle_get_account_list_response(actual_message)
+        elif isinstance(actual_message, ProtoOASymbolByNameRes): # Added for global dispatch if not caught by deferred
+            print("  Dispatching to _handle_symbol_by_name_res (globally)")
+            # Note: _handle_symbol_by_name_res expects original_symbol_name, success_callback, error_callback
+            # If dispatched globally, these won't be available. This handler is best used with direct deferreds.
+            # For now, just log it. Proper handling would require matching clientMsgId if used, or a different design.
+            print(f"  Received ProtoOASymbolByNameRes globally: {actual_message}")
+            # self._handle_symbol_by_name_res(actual_message, "UNKNOWN_ORIGINAL_SYMBOL") # This would be problematic
+        elif isinstance(actual_message, ProtoOASubscribeSpotsRes): # Added for global dispatch
+            print("  Dispatching to _handle_subscribe_spots_res (globally)")
+            # Note: _handle_subscribe_spots_res expects symbol_id. Global dispatch lacks this.
+            # This is best handled by direct deferreds.
+            print(f"  Received ProtoOASubscribeSpotsRes globally: {actual_message}")
+            # self._handle_subscribe_spots_res(actual_message, UNKNOWN_SYMBOL_ID) # Problematic
         elif isinstance(actual_message, ProtoOATraderRes):
             print("  Dispatching to _handle_trader_response")
             self._handle_trader_response(actual_message)
@@ -315,8 +287,9 @@ class Trader:
             print("  Dispatching to _handle_trader_updated_event")
             self._handle_trader_updated_event(actual_message)
         elif isinstance(actual_message, ProtoOASpotEvent):
-            # self._handle_spot_event(actual_message) # Potentially noisy
-             print("  Received ProtoOASpotEvent (handler commented out).")
+            # Dispatching to _handle_spot_event if it's a spot event
+            print("  Dispatching to _handle_spot_event")
+            self._handle_spot_event(actual_message)
         elif isinstance(actual_message, ProtoOAExecutionEvent):
             # self._handle_execution_event(actual_message) # Potentially noisy
              print("  Received ProtoOAExecutionEvent (handler commented out).")
@@ -328,17 +301,23 @@ class Trader:
         elif isinstance(actual_message, ProtoErrorRes): # Common error
             print(f"  Dispatching to ProtoErrorRes (common) handler. Error code: {actual_message.errorCode}, Description: {actual_message.description}")
             self._last_error = f"Common Error {actual_message.errorCode}: {actual_message.description}"
-        # Check if it's still the original ProtoMessage wrapper because no deserialization rule matched
-        elif actual_message is message and isinstance(message, ProtoMessage):
-            print(f"  ProtoMessage with PayloadType {payload_type} was not handled by specific type checks after deserialization attempt.")
-        elif not isinstance(actual_message, ProtoMessage) and actual_message is message: # Original message was not ProtoMessage
+        # Check if it's still the ProtoMessage wrapper (meaning Protobuf.extract didn't deserialize it further)
+        elif isinstance(actual_message, ProtoMessage): # Covers actual_message is message (if message was ProtoMessage)
+                                                       # and actual_message is the result of extract but still a wrapper.
+            print(f"  ProtoMessage with PayloadType {actual_message.payloadType} was not handled by specific type checks.")
+        elif actual_message is message and not isinstance(message, ProtoMessage): # Original message was not ProtoMessage and not handled
              print(f"  Unhandled non-ProtoMessage type in _on_message_received: {type(actual_message)}")
         else: # Should ideally not be reached if all cases are handled
-            print(f"  Message of type {type(actual_message)} (PayloadType {payload_type if payload_type else 'N/A'}) fell through all handlers.")
+            print(f"  Message of type {type(actual_message)} (PayloadType {final_payload_type_for_log}) fell through all handlers.")
 
     # Handlers
     def _handle_app_auth_response(self, response: ProtoOAApplicationAuthRes) -> None:
         print("ApplicationAuth response received.")
+
+        if self._account_auth_initiated:
+            print("Account authentication process already initiated, skipping duplicate _handle_app_auth_response.")
+            return
+
         # The access token from ProtoOAApplicationAuthRes is for the application's session.
         # We have a user-specific OAuth access token in self._access_token (if OAuth flow completed).
         # We should not overwrite self._access_token here if it was set by OAuth.
@@ -364,135 +343,454 @@ class Trader:
                 self._client.stopService()
             return
 
-        # Proceed to account auth or account list using the existing self._access_token (from OAuth)
-        if self.ctid_trader_account_id:
-            # If we have a pre-configured ctidTraderAccountId, the original flow was to directly authenticate it.
-            # However, given the server responded with ProtoOAGetCtidProfileByTokenRes to AccountAuthReq,
-            # it implies the token might always need to go through a profile check first,
-            # or that AccountAuthReq for a *specific* cTID should only be sent *after* confirming that cTID
-            # is associated with the token (e.g. via profile or account list).
-
-            # New Hypothesis: Always try to get profile first if we have an OAuth token.
-            # If a ctid_trader_account_id is configured, we can use it to verify against the profile/account list later.
-            print("Attempting to get profile by token first, even if default ctidTraderAccountId is set.")
-            self._send_get_ctid_profile_request()
-            # Old logic: self._send_account_auth_request(self.ctid_trader_account_id)
+        # Proceed to account authentication or discovery, using the OAuth access token (self._access_token)
+        if self.ctid_trader_account_id and self._access_token:
+            # If a ctidTraderAccountId is known (e.g., from settings) and we have an OAuth access token,
+            # proceed directly with ProtoOAAccountAuthReq as per standard Spotware flow.
+            print(f"Known ctidTraderAccountId: {self.ctid_trader_account_id}. Attempting ProtoOAAccountAuthReq.")
+            self._account_auth_initiated = True # Set flag before sending
+            self._send_account_auth_request(self.ctid_trader_account_id)
+        elif self._access_token:
+            # If ctidTraderAccountId is not known, but we have an access token,
+            # first try to get the account list associated with this token.
+            # ProtoOAGetAccountListByAccessTokenReq is preferred over ProtoOAGetCtidProfileByTokenReq
+            # if the goal is to find trading accounts. Profile is more about user details.
+            print("No default ctidTraderAccountId. Attempting to get account list by access token.")
+            self._account_auth_initiated = True # Set flag before sending
+            self._send_get_account_list_request()
         else:
-            print("No default ctidTraderAccountId. Attempting to get profile by token.")
-            self._send_get_ctid_profile_request()
+            # This case should ideally be prevented by earlier checks in the connect() flow.
+            self._last_error = "Critical: Cannot proceed with account auth/discovery. Missing ctidTraderAccountId or access token after app auth."
+            print(self._last_error)
+            if self._client:
+                self._client.stopService()
 
 
     def _handle_get_ctid_profile_response(self, response: ProtoOAGetCtidProfileByTokenRes) -> None:
         """
         Handles the response from a ProtoOAGetCtidProfileByTokenReq.
-        This method is now also tentatively handling the case where this response
-        was received *instead of* an expected ProtoOAAccountAuthRes.
+        Its primary role is to provide user profile information.
+        It might also list associated ctidTraderAccountIds, which can be used if an ID isn't already known.
+        This handler does NOT set self.is_connected; connection is confirmed by ProtoOAAccountAuthRes.
         """
-        print(f"Received ProtoOAGetCtidProfileByTokenRes.")
-        if hasattr(response, 'ctidTraderAccount') and response.ctidTraderAccount: # Check if field exists and is not empty/default
-            # Assuming ctidTraderAccount is a list of ProtoOACTIDTraderAccount as in GetAccountListRes
-            # Or if it's a single ProtoOACTIDTraderAccount object.
-            # The definition of ProtoOAGetCtidProfileByTokenRes needs to be checked for actual structure.
-            # For now, let's assume it gives a single ctidTraderId or similar.
-            # Let's assume it has a field like `ctidProfile.ctidTraderId` or directly `ctidTraderId`.
-            # This is speculative based on the name.
-            # A common pattern is that it might return a list of ProtoOACtidTraderAccount objects.
+        print(f"Received ProtoOAGetCtidProfileByTokenRes. Content: {response}")
 
-            # Placeholder: Log the whole response to understand its structure.
-            print(f"  Profile Response Content: {response}")
+        # Example of how you might use profile data if needed:
+        # if hasattr(response, 'profile') and response.profile:
+        #     print(f"  User Profile Nickname: {response.profile.nickname}")
 
-            # Example: if response.ctidProfile.ctidTraderId exists:
-            # self.ctid_trader_account_id = response.ctidProfile.ctidTraderId
-            # print(f"  Extracted ctidTraderAccountId from profile: {self.ctid_trader_account_id}")
-            # self._send_account_auth_request(self.ctid_trader_account_id)
+        # Check if the response contains ctidTraderAccount details.
+        # According to some message definitions, ProtoOAGetCtidProfileByTokenRes
+        # might not directly list accounts. ProtoOAGetAccountListByAccessTokenRes is for that.
+        # However, if it *does* provide an account ID and we don't have one, we could note it.
+        # For now, this handler mainly logs. If a ctidTraderAccountId is needed and not present,
+        # the flow should have gone through _send_get_account_list_request.
 
-            # For now, let's assume the response *might* contain a single ctidTraderAccountId
-            # that we can use. If Spotware's actual flow for this token type is different,
-            # this will need adjustment.
-            # If the response directly gives a ctid for a *trading account*, we can use it.
-            # The message definition for ProtoOAGetCtidProfileByTokenRes is needed.
-            # Typically, a "profile" is user-level, not account-level.
-            # It might give a cTrader ID (user ID), then we'd need ProtoOAGetAccountListByAccessTokenReq.
+        # If, for some reason, this response is used to discover a ctidTraderAccountId:
+        # found_ctid = None
+        # if hasattr(response, 'ctidProfile') and hasattr(response.ctidProfile, 'ctidTraderId'): # Speculative
+        #     found_ctid = response.ctidProfile.ctidTraderId
+        #
+        # if found_ctid and not self.ctid_trader_account_id:
+        #     print(f"  Discovered ctidTraderAccountId from profile: {found_ctid}. Will attempt account auth.")
+        #     self.ctid_trader_account_id = found_ctid
+        #     self._send_account_auth_request(self.ctid_trader_account_id)
+        # elif not self.ctid_trader_account_id:
+        #     self._last_error = "Profile received, but no ctidTraderAccountId found to proceed with account auth."
+        #     print(self._last_error)
 
-            # Given the server sent THIS in response to AccountAuth, it's very confusing.
-            # Let's assume for a moment this *is* the new "success" for AccountAuth
-            # and it contains the necessary details to consider the account "authed".
-            # This is a big assumption.
-            if hasattr(response, 'ctidProfile') and hasattr(response.ctidProfile, 'ctidTraderId'):
-                 # This is a guess at the structure of ProtoOAGetCtidProfileByTokenRes
-                 # It might be response.ctidTraderAccount[0].ctidTraderAccountId if it returns a list of accounts
-                 # For now, let's check if we can get *any* ctid to proceed
-                potential_ctid = response.ctidProfile.ctidTraderId # Highly speculative field name
-                if potential_ctid:
-                    print(f"  Potential cTID from profile response: {potential_ctid}")
-                    if not self.ctid_trader_account_id: # If not already set
-                        self.ctid_trader_account_id = potential_ctid
-
-                    # Does this response mean we are "connected" for this ctid?
-                    # Or do we still need to send ProtoOAAccountAuthReq?
-                    # If server sent this INSTEAD of ProtoOAAccountAuthRes, it's possible this
-                    # IS the new "account auth" for this token type.
-                    print("  Assuming profile response implies account readiness. Fetching trader details...")
-                    self.is_connected = True # Tentative: mark as connected to see account details
-                    self._send_get_trader_request(self.ctid_trader_account_id)
-                    return
-
-            print("  ProtoOAGetCtidProfileByTokenRes received, but ctidTraderAccountId not clearly identified or structure unknown.")
-            self._last_error = "Profile received, but account ID unclear."
-            # What to do now? Maybe get account list?
-            # self._send_get_account_list_request() # This also requires an access token.
-
-        else:
-            print("  ProtoOAGetCtidProfileByTokenRes was empty or did not contain expected ctid information.")
-            self._last_error = "Failed to get ctid profile by token or profile empty."
+        # This response does not confirm a live trading session for an account.
+        # That's the role of ProtoOAAccountAuthRes.
+        pass
 
 
     def _handle_account_auth_response(self, response: ProtoOAAccountAuthRes) -> None:
-        print("AccountAuth response.")
+        print(f"Received ProtoOAAccountAuthRes: {response}")
+        # The response contains the ctidTraderAccountId that was authenticated.
+        # We should verify it matches the one we intended to authenticate.
         if response.ctidTraderAccountId == self.ctid_trader_account_id:
-            self.is_connected = True
+            print(f"Successfully authenticated account {self.ctid_trader_account_id}.")
+            self.is_connected = True # Mark as connected for this specific account
+            self._last_error = ""     # Clear any previous errors
+
+            # After successful account auth, fetch initial trader details (balance, equity)
             self._send_get_trader_request(self.ctid_trader_account_id)
+
+            # TODO: Subscribe to spots, etc., as needed by the application
+            # self._send_subscribe_spots_request(symbol_id) # Example
         else:
-            print("AccountAuth failed.")
+            print(f"AccountAuth failed. Expected ctidTraderAccountId {self.ctid_trader_account_id}, "
+                  f"but response was for {response.ctidTraderAccountId if hasattr(response, 'ctidTraderAccountId') else 'unknown'}.")
+            self._last_error = "Account authentication failed (ID mismatch or error)."
+            self.is_connected = False
+            # Consider stopping the client if account auth fails critically
+            if self._client:
+                self._client.stopService()
 
     def _handle_get_account_list_response(self, response: ProtoOAGetAccountListByAccessTokenRes) -> None:
         print("Account list response.")
         accounts = getattr(response, 'ctidTraderAccount', [])
         if not accounts:
-            print("No accounts available.")
+            print("No accounts available for this access token.")
+            self._last_error = "No trading accounts found for this access token."
+            # Potentially disconnect or signal error more formally if no accounts mean connection cannot proceed.
+            if self._client and self._is_client_connected:
+                self._client.stopService() # Or some other error state
             return
-        self.ctid_trader_account_id = accounts[0].ctidTraderAccountId
-        self.settings.openapi.default_ctid_trader_account_id = self.ctid_trader_account_id
+
+        # TODO: If multiple accounts, allow user selection. For now, using the first.
+        selected_account = accounts[0] # Assuming ctidTraderAccount is a list of ProtoOACtidTraderAccount
+        if not selected_account.ctidTraderAccountId:
+            print("Error: Account in list has no ctidTraderAccountId.")
+            self._last_error = "Account found but missing ID."
+            return
+
+        self.ctid_trader_account_id = selected_account.ctidTraderAccountId
+        print(f"Selected ctidTraderAccountId from list: {self.ctid_trader_account_id}")
+        # Optionally save to settings if this discovery should update the default
+        # self.settings.openapi.default_ctid_trader_account_id = self.ctid_trader_account_id
+
+        # Now that we have a ctidTraderAccountId, authenticate this account
         self._send_account_auth_request(self.ctid_trader_account_id)
 
-    def _handle_trader_response(self, response: ProtoOATraderRes) -> None:
-        trader_details = self._update_trader_details(
-            "Trader details response.", response.trader
-        )
-        if trader_details:
-            self.account_id = str(trader_details.ctidTraderAccountId)
-            # Potentially other fields from trader_details could be assigned here if needed
+    def _handle_trader_response(self, response_wrapper: Any) -> None:
+        # If this is called directly by a Deferred, response_wrapper might be ProtoMessage
+        # If called after global _on_message_received, it's already extracted.
+        if isinstance(response_wrapper, ProtoMessage):
+            actual_message = Protobuf.extract(response_wrapper)
+            print(f"_handle_trader_response: Extracted {type(actual_message)} from ProtoMessage wrapper.")
+        else:
+            actual_message = response_wrapper # Assume it's already the specific message type
 
-    def _handle_trader_updated_event(self, event: ProtoOATraderUpdatedEvent) -> None:
-        self._update_trader_details(
-            "Trader updated event.", event.trader
+        if not isinstance(actual_message, ProtoOATraderRes):
+            print(f"_handle_trader_response: Expected ProtoOATraderRes, got {type(actual_message)}. Message: {actual_message}")
+            return
+
+        # Now actual_message is definitely ProtoOATraderRes
+        trader_object = actual_message.trader # Access the nested ProtoOATrader object
+
+        trader_details_updated = self._update_trader_details(
+            "Trader details response.", trader_object
         )
+
+        if trader_details_updated and hasattr(trader_object, 'ctidTraderAccountId'):
+            current_ctid = getattr(trader_object, 'ctidTraderAccountId')
+            print(f"Value of trader_object.ctidTraderAccountId before assignment: {current_ctid}, type: {type(current_ctid)}")
+            self.account_id = str(current_ctid)
+            print(f"self.account_id set to: {self.account_id}")
+        elif trader_details_updated:
+            print(f"Trader details updated, but ctidTraderAccountId missing from trader_object. trader_object: {trader_object}")
+        else:
+            print("_handle_trader_response: _update_trader_details did not return updated details or trader_object was None.")
+
+
+    def _handle_trader_updated_event(self, event_wrapper: Any) -> None:
+        if isinstance(event_wrapper, ProtoMessage):
+            actual_event = Protobuf.extract(event_wrapper)
+            print(f"_handle_trader_updated_event: Extracted {type(actual_event)} from ProtoMessage wrapper.")
+        else:
+            actual_event = event_wrapper
+
+        if not isinstance(actual_event, ProtoOATraderUpdatedEvent):
+            print(f"_handle_trader_updated_event: Expected ProtoOATraderUpdatedEvent, got {type(actual_event)}. Message: {actual_event}")
+            return
+
+        self._update_trader_details(
+            "Trader updated event.", actual_event.trader # Access nested ProtoOATrader
+        )
+        # Note: TraderUpdatedEvent might not always update self.account_id if it's already set,
+        # but it will refresh balance, equity, margin if present in actual_event.trader.
+
+    def _handle_symbol_by_name_res(self, response_wrapper: Any, original_symbol_name: str, success_callback=None, error_callback=None):
+        """Handles ProtoOASymbolByNameRes, caches details, and calls callbacks."""
+        if isinstance(response_wrapper, ProtoMessage):
+            actual_message = Protobuf.extract(response_wrapper)
+            print(f"_handle_symbol_by_name_res: Extracted {type(actual_message)} from ProtoMessage wrapper.")
+        else:
+            actual_message = response_wrapper
+
+        if not isinstance(actual_message, ProtoOASymbolByNameRes):
+            err_msg = f"Expected ProtoOASymbolByNameRes, got {type(actual_message)}. Message: {actual_message}"
+            print(f"_handle_symbol_by_name_res: {err_msg}")
+            if error_callback:
+                error_callback(original_symbol_name, err_msg)
+            return
+
+        # ProtoOASymbolByNameRes contains a list of symbols (usually one if found by name)
+        if not actual_message.symbol:
+            err_msg = f"Symbol '{original_symbol_name}' not found by API."
+            print(f"_handle_symbol_by_name_res: {err_msg}")
+            if error_callback:
+                error_callback(original_symbol_name, err_msg)
+            return
+
+        # Assuming the first symbol in the list is the one we want
+        symbol_data: ProtoOASymbol = actual_message.symbol[0]
+        symbol_id = getattr(symbol_data, 'symbolId', None)
+        digits = getattr(symbol_data, 'digits', 5) # Default to 5 if not present
+        symbol_name_from_api = getattr(symbol_data, 'symbolName', original_symbol_name) # Use API's version of name if available
+
+        if symbol_id is None:
+            err_msg = f"Symbol ID missing in ProtoOASymbolByNameRes for '{original_symbol_name}'. Data: {symbol_data}"
+            print(f"_handle_symbol_by_name_res: {err_msg}")
+            if error_callback:
+                error_callback(original_symbol_name, err_msg)
+            return
+
+        # Normalize symbol name for consistent map key (e.g., remove '/')
+        normalized_api_symbol_name = symbol_name_from_api.replace('/', '')
+
+        self.symbol_details_cache[symbol_id] = {
+            'symbolId': symbol_id,
+            'name': normalized_api_symbol_name, # Store the normalized name from API
+            'original_requested_name': original_symbol_name, # Could be useful for debugging
+            'digits': digits,
+            # Potentially cache other useful fields from symbol_data:
+            # 'description': getattr(symbol_data, 'description', ''),
+            # 'categoryName': getattr(symbol_data, 'categoryName', ''),
+            # etc.
+        }
+        self.symbol_name_to_id_map[normalized_api_symbol_name] = symbol_id
+        # Also map the originally requested name if it's different, for easier lookup
+        if original_symbol_name.replace('/', '') != normalized_api_symbol_name:
+             self.symbol_name_to_id_map[original_symbol_name.replace('/', '')] = symbol_id
+
+
+        print(f"Cached symbol details for {normalized_api_symbol_name} (ID: {symbol_id}): Digits={digits}")
+
+        if success_callback:
+            success_callback(symbol_id) # Pass symbol_id to the next step (e.g., subscription)
+
+    def fetch_symbol_details(self, symbol_name: str, success_callback=None, error_callback=None) -> None:
+        """
+        Fetches details for a symbol by its name (e.g., "EURUSD", "EUR/USD").
+        Caches the details and calls success_callback(symbol_id) or error_callback(error_message).
+        """
+        normalized_name = symbol_name.replace('/', '')
+        if not self._client or not self._is_client_connected :
+            print("Cannot fetch symbol details: Client not connected.")
+            if error_callback:
+                error_callback(symbol_name, "Client not connected")
+            return
+
+        # Check cache first (using normalized name)
+        if normalized_name in self.symbol_name_to_id_map:
+            cached_symbol_id = self.symbol_name_to_id_map[normalized_name]
+            if cached_symbol_id in self.symbol_details_cache:
+                print(f"Symbol details for '{normalized_name}' found in cache. ID: {cached_symbol_id}")
+                if success_callback:
+                    success_callback(cached_symbol_id)
+                return
+
+        print(f"Fetching symbol details from API for: {symbol_name} (normalized: {normalized_name})")
+        req = ProtoOASymbolByNameReq()
+        req.symbolName = symbol_name # API might expect "EUR/USD" or "EURUSD", usually "EUR/USD"
+        # The API documentation or examples should clarify the expected format for symbolName.
+        # For OpenApiPy, it's typically the name as seen in cTrader (e.g. "EUR/USD").
+
+        # Add clientMsgId for specific callback handling if the library supports it well for this
+        # msg_id = self._next_message_id()
+        # req.clientMsgId = msg_id # This might not be part of ProtoOASymbolByNameReq definition
+
+        print(f"Sending ProtoOASymbolByNameReq: {req}")
+        try:
+            d = self._client.send(req)
+
+            # Pass the original callbacks and symbol_name to the handler through lambda
+            d.addCallbacks(
+                lambda response: self._handle_symbol_by_name_res(response, symbol_name, success_callback, error_callback),
+                errback=lambda failure: (
+                    print(f"Deferred error fetching details for {symbol_name}: {failure.getErrorMessage()}"),
+                    self._handle_send_error(failure), # Log full traceback
+                    error_callback(symbol_name, failure.getErrorMessage()) if error_callback else None
+                )
+            )
+            print(f"Deferred created for ProtoOASymbolByNameReq for {symbol_name}.")
+        except Exception as e:
+            print(f"Exception during fetch_symbol_details send command for {symbol_name}: {e}")
+            if error_callback:
+                error_callback(symbol_name, str(e))
+
+    def _handle_subscribe_spots_res(self, response_wrapper: Any, symbol_id: int):
+        """Handles ProtoOASubscribeSpotsRes to confirm subscription."""
+        if isinstance(response_wrapper, ProtoMessage):
+            actual_message = Protobuf.extract(response_wrapper)
+            print(f"_handle_subscribe_spots_res: Extracted {type(actual_message)} from ProtoMessage wrapper.")
+        else:
+            actual_message = response_wrapper
+
+        if not isinstance(actual_message, ProtoOASubscribeSpotsRes):
+            print(f"_handle_subscribe_spots_res: Expected ProtoOASubscribeSpotsRes for symbolId {symbol_id}, got {type(actual_message)}. Message: {actual_message}")
+            # Check if it's an error response that needs general handling
+            if isinstance(actual_message, ProtoOAErrorRes):
+                print(f"  Error during spot subscription for symbolId {symbol_id}: {actual_message.errorCode} - {actual_message.description}")
+            elif isinstance(actual_message, ProtoErrorRes):
+                 print(f"  Common Error during spot subscription for symbolId {symbol_id}: {actual_message.errorCode} - {actual_message.description}")
+            return
+
+        # ProtoOASubscribeSpotsRes doesn't have much other than confirming the subscription context (ctidTraderAccountId).
+        # The actual spot events will follow separately.
+        print(f"Successfully processed subscription response for symbolId {symbol_id}. Spot events should follow. Response: {actual_message}")
+        # We could maintain a set of subscribed symbol IDs if needed: self.subscribed_spot_ids.add(symbol_id)
+
+
+    def _proceed_to_subscribe_spots(self, symbol_id: int) -> None:
+        """Internal method to send spot subscription request once symbol_id is known."""
+        if not self._client or not self._is_client_connected or not self.ctid_trader_account_id:
+            print(f"Cannot subscribe to spots for symbolId {symbol_id}: Client not connected or ctidTraderAccountId not set.")
+            return
+
+        print(f"Proceeding to subscribe to spots for symbolId: {symbol_id}")
+        req = ProtoOASubscribeSpotsReq()
+        req.ctidTraderAccountId = self.ctid_trader_account_id
+        req.symbolId.append(symbol_id) # symbolId is a repeated field
+
+        print(f"Sending ProtoOASubscribeSpotsReq: {req}")
+        try:
+            d = self._client.send(req)
+            d.addCallbacks(
+                lambda response: self._handle_subscribe_spots_res(response, symbol_id),
+                errback=lambda failure: (
+                    print(f"Deferred error subscribing to spots for symbolId {symbol_id}: {failure.getErrorMessage()}"),
+                    self._handle_send_error(failure) # Log full traceback
+                )
+            )
+            print(f"Deferred created for ProtoOASubscribeSpotsReq for symbolId {symbol_id}.")
+        except Exception as e:
+            print(f"Exception during _proceed_to_subscribe_spots for symbolId {symbol_id}: {e}")
+
+    def subscribe_to_symbol(self, symbol_name: str) -> None:
+        """
+        Subscribes to live spot price updates for a given symbol name (e.g., "EURUSD", "EUR/USD").
+        It will first fetch symbol details if not already cached.
+        """
+        if not self.is_connected or not self.ctid_trader_account_id:
+            print(f"Cannot subscribe to '{symbol_name}': Trader not fully connected or account ID not set.")
+            return
+
+        normalized_name = symbol_name.replace('/', '').upper() # Normalize for consistent lookup
+
+        def _on_symbol_details_error(s_name, error_message):
+            print(f"Error fetching details for '{s_name}' during subscription attempt: {error_message}")
+            # Optionally, notify GUI of subscription failure
+
+        # Check if symbol_id is already known
+        cached_symbol_id = self.symbol_name_to_id_map.get(normalized_name)
+        if cached_symbol_id and cached_symbol_id in self.symbol_details_cache:
+            print(f"Using cached symbolId {cached_symbol_id} for '{normalized_name}' to subscribe.")
+            self._proceed_to_subscribe_spots(cached_symbol_id)
+        else:
+            print(f"Details for '{normalized_name}' not cached. Fetching before subscribing.")
+            # Use the original symbol_name for fetching as API might expect "EUR/USD"
+            self.fetch_symbol_details(
+                symbol_name,
+                success_callback=self._proceed_to_subscribe_spots,
+                error_callback=_on_symbol_details_error
+            )
+
+    # TODO: Implement unsubscribe_from_symbol if needed
+
 
     def _update_trader_details(self, log_message: str, trader_proto: ProtoOATrader):
         """Helper to update trader balance and equity from a ProtoOATrader object."""
         print(log_message)
         if trader_proto:
-            self.balance = trader_proto.balance / 100.0  # Assuming balance is in cents
-            self.equity = trader_proto.equity / 100.0    # Assuming equity is in cents
-            # self.currency = trader_proto.currency # If currency is available and needed
-            # self.ctid_trader_account_id = trader_proto.ctidTraderAccountId # Already known, but can confirm
-            print(f"Updated account {trader_proto.ctidTraderAccountId}: Balance: {self.balance}, Equity: {self.equity}")
+            print(f"Full ProtoOATrader object received in _update_trader_details: {trader_proto}")
+
+            # Safely get ctidTraderAccountId for logging, though it's not set here directly
+            logged_ctid = getattr(trader_proto, 'ctidTraderAccountId', 'N/A')
+
+            balance_val = getattr(trader_proto, 'balance', None)
+            if balance_val is not None:
+                self.balance = balance_val / 100.0
+                print(f"  Updated balance for {logged_ctid}: {self.balance}")
+            else:
+                print(f"  Balance not found in ProtoOATrader for {logged_ctid}")
+
+            equity_val = getattr(trader_proto, 'equity', None)
+            if equity_val is not None:
+                self.equity = equity_val / 100.0
+                print(f"  Updated equity for {logged_ctid}: {self.equity}")
+            else:
+                # self.equity remains as its previous value (or None if first time)
+                print(f"  Equity not found in ProtoOATrader for {logged_ctid}. self.equity remains: {self.equity}")
+
+            currency_val = getattr(trader_proto, 'depositAssetId', None) # depositAssetId is often used for currency ID
+            # TODO: Convert depositAssetId to currency string if mapping is available
+            # For now, just store the ID if it exists, or keep self.currency as is.
+            if currency_val is not None:
+                 # self.currency = str(currency_val) # Or map to symbol
+                 print(f"  depositAssetId (currency ID) for {logged_ctid}: {currency_val}")
+
+
+            # Placeholder for margin - we need to see what fields are available from logs
+            # Example:
+            # used_margin_val = getattr(trader_proto, 'usedMargin', None) # Or 'totalMarginUsed' etc.
+            # if used_margin_val is not None:
+            #     self.used_margin = used_margin_val / 100.0
+            #     print(f"  Updated used_margin for {logged_ctid}: {self.used_margin}")
+            # else:
+            #     print(f"  Used margin not found in ProtoOATrader for {logged_ctid}. self.used_margin remains: {self.used_margin}")
+
             return trader_proto
+        else:
+            print("_update_trader_details received empty trader_proto.")
         return None
 
     def _handle_spot_event(self, event: ProtoOASpotEvent) -> None:
-        # TODO: update self.price_history
-        pass
+        """Handles incoming live spot price events."""
+        symbol_id = getattr(event, 'symbolId', None)
+
+        # ProtoOASpotEvent may contain actual bid/ask or trendbars.
+        # For live ticks, we look for direct bid/ask.
+        # Bid and Ask prices are optional in ProtoOASpotEvent definition.
+        bid_price_raw = getattr(event, 'bid', None)
+        ask_price_raw = getattr(event, 'ask', None)
+
+        if symbol_id is None or bid_price_raw is None: # Ask can sometimes be missing if only bid updates
+            # If it's a trendbar, it would be event.trendbar[0].close or similar.
+            # For now, focusing on direct bid/ask ticks.
+            print(f"_handle_spot_event: Received spot event without symbolId or bid price. Event: {event}")
+            return
+
+        details = self.symbol_details_cache.get(symbol_id)
+        if not details:
+            print(f"_handle_spot_event: WARN - No symbol details (like 'digits') cached for symbolId {symbol_id}. Cannot scale price accurately.")
+            # Potentially use a default digits or skip if this happens, though ideally details are pre-cached.
+            # For now, we might proceed without scaling if digits are missing, which is incorrect for actual use.
+            # Or, decide to not process if details are missing.
+            # Let's assume for now we try to proceed but log heavily.
+            digits = 5 # Defaulting to 5 as a common case, but this is a GUESS.
+        else:
+            digits = details.get('digits', 5) # Default to 5 if not in cache for some reason
+
+        # Scale prices
+        # The raw prices are typically integers. e.g., 123456 for a 5-digit price of 1.23456
+        scaled_bid = bid_price_raw / (10**digits)
+        scaled_ask = ask_price_raw / (10**digits) if ask_price_raw is not None else None # Ask might be missing
+
+        self.latest_symbol_prices[symbol_id] = {'bid': scaled_bid, 'ask': scaled_ask}
+
+        # For debugging and to see price flow:
+        # print(f"Spot Event: SymbolID: {symbol_id}, Bid: {scaled_bid}, Ask: {scaled_ask}")
+
+        if self.price_update_callback:
+            try:
+                self.price_update_callback(symbol_id, scaled_bid, scaled_ask)
+            except Exception as e:
+                print(f"Error calling price_update_callback: {e}")
+
+        # Update self.price_history if it's being used for the current symbol
+        # This part needs logic to know which symbol's history to update if price_history is for one symbol.
+        # For now, let's assume price_history might be for the 'active' symbol in the GUI.
+        # This would require knowing the active symbolId.
+        # current_active_symbol_id_in_gui = ... # This needs to be obtained or passed
+        # if symbol_id == current_active_symbol_id_in_gui:
+        #     if len(self.price_history) >= self.history_size:
+        #         self.price_history.pop(0)
+        #     mid_price = (scaled_bid + scaled_ask) / 2 if scaled_ask is not None else scaled_bid
+        #     self.price_history.append(mid_price)
+
 
     def _handle_execution_event(self, event: ProtoOAExecutionEvent) -> None:
         # TODO: handle executions
@@ -500,6 +798,12 @@ class Trader:
 
     def _handle_send_error(self, failure: Any) -> None:
         print(f"Send error: {failure.getErrorMessage()}")
+        if hasattr(failure, 'printTraceback'):
+            print("Traceback for send error:")
+            failure.printTraceback(file=sys.stderr)
+        else:
+            print("Failure object does not have printTraceback method. Full failure object:")
+            print(failure)
         self._last_error = failure.getErrorMessage()
 
     # Sending methods
@@ -512,10 +816,10 @@ class Trader:
         req.ctidTraderAccountId = ctid
         req.accessToken = self._access_token or "" # Should be valid now
 
-        print(f"Sending ProtoOAAccountAuthReq for ctid: {ctid}")
+        print(f"Sending ProtoOAAccountAuthReq for ctid {ctid}: {req}")
         try:
             d = self._client.send(req)
-            print(f"Deferred created for AccountAuthReq: {d}")
+            print(f"Deferred created for ProtoOAAccountAuthReq: {d}")
 
             def success_callback(response_msg):
                 # This callback is mostly for confirming the Deferred fired successfully.
@@ -528,10 +832,11 @@ class Trader:
                 # Print a summary of the failure, and the full traceback if it's an exception
                 if hasattr(failure_reason, 'getErrorMessage'):
                     print(f"  Error Message: {failure_reason.getErrorMessage()}")
-                if hasattr(failure_reason, 'getTraceback'):
-                    print(f"  Traceback: {failure_reason.getTraceback()}")
+                if hasattr(failure_reason, 'printTraceback'):
+                    print(f"  Traceback for AccountAuthReq error:")
+                    failure_reason.printTraceback(file=sys.stderr)
                 else:
-                    print(f"  Failure object: {failure_reason}")
+                    print(f"  Failure object (no printTraceback): {failure_reason}")
                 self._handle_send_error(failure_reason) # Ensure our existing error handler is called
 
             d.addCallbacks(success_callback, errback=error_callback)
@@ -558,6 +863,7 @@ class Trader:
                 self._client.stopService()
             return
         req.accessToken = self._access_token
+        print(f"Sending ProtoOAGetAccountListByAccessTokenReq: {req}")
         d = self._client.send(req)
         d.addCallbacks(self._handle_get_account_list_response, self._handle_send_error)
 
@@ -571,6 +877,7 @@ class Trader:
         # Note: ProtoOATraderReq does not directly take an access token in its fields.
         # The authentication is expected to be session-based after AccountAuth.
         # If a token were needed here, the message definition would include it.
+        print(f"Sending ProtoOATraderReq for ctid {ctid}: {req}")
         d = self._client.send(req)
         d.addCallbacks(self._handle_trader_response, self._handle_send_error)
 
@@ -590,9 +897,10 @@ class Trader:
         req = ProtoOAGetCtidProfileByTokenReq()
         req.accessToken = self._access_token
 
+        print(f"Sending ProtoOAGetCtidProfileByTokenReq: {req}")
         try:
             d = self._client.send(req)
-            print(f"Deferred created for GetCtidProfileByTokenReq: {d}")
+            print(f"Deferred created for ProtoOAGetCtidProfileByTokenReq: {d}")
 
             # Adding specific callbacks for this request to see its fate
             def profile_req_success_callback(response_msg):
@@ -602,10 +910,11 @@ class Trader:
                 print(f"GetCtidProfileByTokenReq error_callback triggered. Failure:")
                 if hasattr(failure_reason, 'getErrorMessage'):
                     print(f"  Error Message: {failure_reason.getErrorMessage()}")
-                if hasattr(failure_reason, 'getTraceback'): # May be verbose
-                    print(f"  Traceback: {failure_reason.getTraceback(brief=True, capN=10)}") # সংক্ষিপ্ত ট্রেসব্যাক
+                if hasattr(failure_reason, 'printTraceback'): # May be verbose
+                    print(f"  Traceback for GetCtidProfileByTokenReq error:")
+                    failure_reason.printTraceback(file=sys.stderr)
                 else:
-                    print(f"  Failure object: {failure_reason}")
+                    print(f"  Failure object (no printTraceback): {failure_reason}")
                 self._handle_send_error(failure_reason)
 
             d.addCallbacks(profile_req_success_callback, errback=profile_req_error_callback)
@@ -774,37 +1083,6 @@ class Trader:
             return False
 
     def _stop_local_http_server(self):
-        if self._http_server:
-            print("Shutting down local HTTP server...")
-            self._http_server.shutdown() # Signal server to stop serve_forever loop
-            self._http_server.server_close() # Close the server socket
-            self._http_server = None
-        if self._http_server_thread and self._http_server_thread.is_alive():
-            self._http_server_thread.join(timeout=5) # Wait for thread to finish
-            if self._http_server_thread.is_alive():
-                print("Warning: HTTP server thread did not terminate cleanly.")
-        self._http_server_thread = None
-        print("Local HTTP server stopped.")
-
-
-    def _stop_local_http_server(self):
-        """Stops the local HTTP callback server if it is running."""
-        if self._http_server:
-            print("Shutting down local HTTP server...")
-            self._http_server.shutdown() # Signal server to stop serve_forever loop
-            self._http_server.server_close() # Close the server socket
-            self._http_server = None
-        if self._http_server_thread and self._http_server_thread.is_alive():
-            self._http_server_thread.join(timeout=5) # Wait for thread to finish
-            if self._http_server_thread.is_alive():
-                print("Warning: HTTP server thread did not terminate cleanly.")
-        self._http_server_thread = None
-        print("Local HTTP server stopped.")
-
-
-    # This is the original _stop_local_http_server method, adding docstring to it.
-    def _stop_local_http_server(self):
-        """Stops the local HTTP callback server if it is running."""
         if self._http_server:
             print("Shutting down local HTTP server...")
             self._http_server.shutdown() # Signal server to stop serve_forever loop
@@ -1034,15 +1312,64 @@ class Trader:
 
     def get_account_summary(self) -> Dict[str, Any]:
         if not USE_OPENAPI_LIB:
-            return {"account_id": "MOCK", "balance": 0.0, "equity": 0.0}
+            return {"account_id": "MOCK", "balance": 0.0, "equity": 0.0, "margin": 0.0}
         if not self.is_connected:
-            return {"account_id": "connecting..."}
-        return {"account_id": self.account_id, "balance": self.balance, "equity": self.equity}
+            # Return current values even if not fully "connected" but some data might be partially loaded
+            return {
+                "account_id": self.account_id if self.account_id else "connecting...",
+                "balance": self.balance,
+                "equity": self.equity,
+                "margin": self.used_margin
+            }
+        return {
+            "account_id": self.account_id,
+            "balance": self.balance,
+            "equity": self.equity,
+            "margin": self.used_margin # This will be None initially, or updated from ProtoOATrader
+        }
 
-    def get_market_price(self, symbol: str) -> float:
-        if not USE_OPENAPI_LIB or not self.price_history:
+    def get_market_price(self, symbol_name: str) -> Optional[float]:
+        """
+        Retrieves the latest cached market price (mid-price) for a given symbol name.
+        Returns None if the symbol is not found or no price data is available.
+        """
+        if not USE_OPENAPI_LIB: # Mock mode
             return round(random.uniform(1.10, 1.20), 5)
-        return self.price_history[-1]
+
+        normalized_name = symbol_name.replace('/', '').upper()
+        symbol_id = self.symbol_name_to_id_map.get(normalized_name)
+
+        if symbol_id is None:
+            print(f"get_market_price: Symbol name '{symbol_name}' (normalized to {normalized_name}) not found in symbol_name_to_id_map.")
+            return None
+
+        price_data = self.latest_symbol_prices.get(symbol_id)
+        if not price_data or 'bid' not in price_data or 'ask' not in price_data:
+            print(f"get_market_price: No bid/ask price data available for symbolId {symbol_id} ({normalized_name}).")
+            return None
+
+        bid = price_data['bid']
+        ask = price_data['ask']
+
+        if bid is None or ask is None:
+            print(f"get_market_price: Bid or Ask is None for symbolId {symbol_id}. Bid: {bid}, Ask: {ask}")
+            return None
+
+        mid_price = (bid + ask) / 2.0
+
+        symbol_details = self.symbol_details_cache.get(symbol_id)
+        digits = 5 # Default digits
+        if symbol_details and 'digits' in symbol_details:
+            digits = symbol_details['digits']
+        else:
+            print(f"get_market_price: WARN - 'digits' not found in symbol_details_cache for symbolId {symbol_id}. Defaulting to 5.")
+
+        return round(mid_price, digits)
 
     def get_price_history(self) -> List[float]:
+        # This method needs to be adapted if self.price_history is to be used
+        # with multiple symbols or if it's populated differently now.
+        # For now, it returns the existing self.price_history.
+        # Consider deprecating or making it symbol-specific if strategies need it.
+        print("WARN: get_price_history currently returns a generic history, not tied to a specific symbol's live updates yet.")
         return list(self.price_history)

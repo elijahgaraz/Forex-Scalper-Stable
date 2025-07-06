@@ -154,22 +154,52 @@ class SettingsPage(ttk.Frame):
     def _on_successful_connection(self, t): # Renamed from _extracted_from_attempt_connection_14
         # t.start_heartbeat() # Heartbeat is typically managed by the Trader/API library after connection
         summary = t.get_account_summary()
-        if summary.get("balance") is None: # Check if summary is still 'connecting...'
-            # This can happen if get_account_summary is called before trader details are fully populated
-            self.after(200, lambda: self._on_successful_connection(t)) # Retry shortly
+
+        # Check if essential details are populated.
+        # Trader.is_connected should be True at this point (checked by _check_connection).
+        # We also need at least account_id and balance to consider it fully loaded for the UI.
+        account_id_from_summary = summary.get("account_id")
+        balance_from_summary = summary.get("balance")
+
+        if account_id_from_summary == "connecting..." or \
+           account_id_from_summary == "–" or \
+           account_id_from_summary is None or \
+           balance_from_summary is None:
+            # This can happen if get_account_summary is called before trader details (like account_id)
+            # are fully populated after connection and ProtoOATraderRes.
+            self.status.config(text="Fetching account details...", foreground="orange") # More informative status
+            self.after(300, lambda: self._on_successful_connection(t)) # Retry shortly
             return
 
-        self.account_id_var.set(summary.get("account_id", "–"))
-        self.balance_var.set(f"{summary['balance']:.2f}")
-        self.equity_var.set(f"{summary['equity']:.2f}")
-        self.margin_var.set(f"{summary['margin']:.2f}")
+        # Account ID
+        account_id_val = summary.get("account_id", "–")
+        self.account_id_var.set(str(account_id_val) if account_id_val is not None else "–")
+
+        # Balance
+        balance_val = summary.get("balance")
+        self.balance_var.set(f"{balance_val:.2f}" if balance_val is not None else "–")
+
+        # Equity
+        equity_val = summary.get("equity")
+        self.equity_var.set(f"{equity_val:.2f}" if equity_val is not None else "–")
+
+        # Margin
+        margin_val = summary.get("margin")
+        self.margin_var.set(f"{margin_val:.2f}" if margin_val is not None else "–")
+
+        # Prepare display strings for messagebox, handling None gracefully
+        display_account_id = str(account_id_val) if account_id_val is not None else "N/A"
+        display_balance = f"{balance_val:.2f}" if balance_val is not None else "N/A"
+        display_equity = f"{equity_val:.2f}" if equity_val is not None else "N/A"
+        display_margin = f"{margin_val:.2f}" if margin_val is not None else "N/A"
+
         messagebox.showinfo(
             "Connected",
             f"Successfully connected!\n\n"
-            f"Account ID: {summary['account_id']}\n"
-            f"Balance: {summary['balance']:.2f}\n"
-            f"Equity: {summary['equity']:.2f}\n"
-            f"Margin: {summary['margin']:.2f}"
+            f"Account ID: {display_account_id}\n"
+            f"Balance: {display_balance}\n"
+            f"Equity: {display_equity}\n"
+            f"Margin: {display_margin}"
         )
         self.status.config(text="Connected ✅", foreground="green")
 
@@ -190,6 +220,7 @@ class TradingPage(ttk.Frame):
         super().__init__(parent, padding=10)
         self.controller = controller
         self.trader = controller.trader
+        self.trader.price_update_callback = self.queue_ui_price_update # Set the callback
 
         # Thread-safe event queue for UI updates
         self._ui_queue = queue.Queue()
@@ -309,15 +340,53 @@ class TradingPage(ttk.Frame):
 
     def update_account_info(self, account_id: str, balance: float | None, equity: float | None):
         """Public method to update account info StringVars from outside (e.g., SettingsPage)."""
-        self.account_id_var_tp.set(account_id)
+        self.account_id_var_tp.set(str(account_id) if account_id is not None else "–")
+
         if balance is not None:
             self.balance_var_tp.set(f"{balance:.2f}")
         else:
             self.balance_var_tp.set("–")
+
         if equity is not None:
             self.equity_var_tp.set(f"{equity:.2f}")
         else:
             self.equity_var_tp.set("–")
+
+        # Note: TradingPage does not currently display margin, so no update for it here.
+
+    def queue_ui_price_update(self, symbol_id: int, bid: float, ask: float):
+        """
+        Safely queues a UI update for the price display from the Trader's thread.
+        This method is set as the callback in the Trader instance.
+        """
+        self._ui_queue.put((self._update_price_display_from_event, (symbol_id, bid, ask)))
+
+    def _update_price_display_from_event(self, symbol_id: int, bid: float, ask: float):
+        """
+        Updates the price display if the incoming price event matches the selected symbol.
+        This method is called by _process_ui_queue on the main Tkinter thread.
+        """
+        selected_symbol_name = self.symbol_var.get() # E.g., "EUR/USD"
+        normalized_selected_name = selected_symbol_name.replace('/', '').upper()
+
+        # Get the symbolId for the currently selected symbol name in the GUI
+        selected_symbol_id_from_map = self.trader.symbol_name_to_id_map.get(normalized_selected_name)
+
+        if selected_symbol_id_from_map is not None and symbol_id == selected_symbol_id_from_map:
+            mid_price = (bid + ask) / 2.0
+
+            # Get digits for formatting (optional, could default to 5)
+            details = self.trader.symbol_details_cache.get(symbol_id)
+            digits = 5
+            if details and 'digits' in details:
+                digits = details['digits']
+
+            self.price_var.set(f"{mid_price:.{digits}f}")
+            # self._log(f"Real-time price update for {selected_symbol_name}: {mid_price:.{digits}f}") # Optional: for verbose logging
+        # else:
+            # Log if price update is for a non-selected symbol (can be noisy)
+            # print(f"Received price update for symbolId {symbol_id}, but current selection is {selected_symbol_name} (ID: {selected_symbol_id_from_map})")
+
 
     def _process_ui_queue(self):
         """Called on the mainloop to drain the UI event queue."""
@@ -331,14 +400,44 @@ class TradingPage(ttk.Frame):
             self.after(100, self._process_ui_queue)
 
     def refresh_price(self):
-        symbol = self.symbol_var.get().replace("/", "")
+        """Handles manual price refresh and subscribes to symbol if not already."""
+        selected_symbol_name = self.symbol_var.get() # This is "EUR/USD" style
+        if not selected_symbol_name:
+            self._log("No symbol selected to refresh price for.")
+            return
+
+        # Subscribe to the selected symbol if not already (or to confirm/re-subscribe)
+        # The trader.subscribe_to_symbol handles caching and prevents redundant API calls for details
+        if self.trader.is_connected: # Only attempt subscription if connected
+            self._log(f"Requesting subscription for {selected_symbol_name}...")
+            self.trader.subscribe_to_symbol(selected_symbol_name)
+            # Note: subscribe_to_symbol is async; price updates will come via callback.
+            # We still try to get a price immediately via get_market_price for manual refresh feel.
+        else:
+            self._log("Trader not connected. Cannot subscribe or fetch live price.")
+            self.price_var.set("N/C") # Not Connected
+            return
+
+        # Attempt to get the current price immediately
+        # The symbol name passed to get_market_price should match what it expects (normalized or not)
+        # Trader.get_market_price normalizes the name internally.
         try:
-            price = self.trader.get_market_price(symbol)
-            self.price_var.set(f"{price:.5f}")
-            self._log(f"Refreshed price for {symbol}: {price:.5f}")
+            price = self.trader.get_market_price(selected_symbol_name)
+            if price is not None:
+                # Formatting with dynamic digits if possible, else default
+                normalized_name = selected_symbol_name.replace('/', '').upper()
+                symbol_id = self.trader.symbol_name_to_id_map.get(normalized_name)
+                digits = 5
+                if symbol_id and symbol_id in self.trader.symbol_details_cache:
+                    digits = self.trader.symbol_details_cache[symbol_id].get('digits', 5)
+                self.price_var.set(f"{price:.{digits}f}")
+                self._log(f"Refreshed price for {selected_symbol_name}: {price:.{digits}f}")
+            else:
+                self.price_var.set("–") # No price available yet / symbol not found by trader
+                self._log(f"No price available yet for {selected_symbol_name} on manual refresh.")
         except Exception as e:
             self.price_var.set("ERR")
-            self._log(f"Error fetching price: {e}")
+            self._log(f"Error fetching price for {selected_symbol_name}: {e}")
 
     def start_scalping(self):
         if self.is_scalping:
