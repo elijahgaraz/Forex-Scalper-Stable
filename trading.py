@@ -86,10 +86,13 @@ try:
         # Specific message types for deserialization
         ProtoOAGetCtidProfileByTokenRes,
         ProtoOAGetCtidProfileByTokenReq,
-        ProtoOASymbolByNameReq, ProtoOASymbolByNameRes, ProtoOASymbol, # For symbol details
-        ProtoOASubscribeSpotsReq, ProtoOASubscribeSpotsRes # For spot subscription
+        ProtoOASymbolsListReq, ProtoOASymbolsListRes, # For getting all symbols
+        ProtoOASubscribeSpotsReq, ProtoOASubscribeSpotsRes, # For spot subscription
+        ProtoOASymbolByIdReq, ProtoOASymbolByIdRes # Still useful for targeted lookups if needed
     )
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrader, ProtoOASymbol
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOATrader, ProtoOASymbol, ProtoOALightSymbol, ProtoOAArchivedSymbol
+    )
     USE_OPENAPI_LIB = True
 except ImportError as e:
     print(f"ctrader-open-api import failed ({e}); running in mock mode.")
@@ -274,6 +277,10 @@ class Trader:
             # For now, just log it. Proper handling would require matching clientMsgId if used, or a different design.
             print(f"  Received ProtoOASymbolByNameRes globally: {actual_message}")
             # self._handle_symbol_by_name_res(actual_message, "UNKNOWN_ORIGINAL_SYMBOL") # This would be problematic
+        elif isinstance(actual_message, ProtoOASymbolsListRes): # Added for global dispatch if not caught by deferred
+            print("  Dispatching to _handle_symbols_list_res (globally)")
+            # This is a fallback; direct deferred callback in _request_all_symbol_details is preferred.
+            self._handle_symbols_list_res(actual_message)
         elif isinstance(actual_message, ProtoOASubscribeSpotsRes): # Added for global dispatch
             print("  Dispatching to _handle_subscribe_spots_res (globally)")
             # Note: _handle_subscribe_spots_res expects symbol_id. Global dispatch lacks this.
@@ -414,10 +421,15 @@ class Trader:
             self._last_error = ""     # Clear any previous errors
 
             # After successful account auth, fetch initial trader details (balance, equity)
-            self._send_get_trader_request(self.ctid_trader_account_id)
+            # And then fetch all symbol details
+            print("Account authenticated. Requesting trader details...")
+            self._send_get_trader_request(self.ctid_trader_account_id) # This will eventually call _update_trader_details
 
-            # TODO: Subscribe to spots, etc., as needed by the application
-            # self._send_subscribe_spots_request(symbol_id) # Example
+            print("Requesting all symbol details post-authentication...")
+            self._request_all_symbol_details() # Fetch all symbols
+
+            # TODO: Subscribe to spots, etc., as needed by the application (e.g., for a default symbol)
+            # This might be better handled by the GUI when it becomes active.
         else:
             print(f"AccountAuth failed. Expected ctidTraderAccountId {self.ctid_trader_account_id}, "
                   f"but response was for {response.ctidTraderAccountId if hasattr(response, 'ctidTraderAccountId') else 'unknown'}.")
@@ -561,55 +573,28 @@ class Trader:
         if success_callback:
             success_callback(symbol_id) # Pass symbol_id to the next step (e.g., subscription)
 
-    def fetch_symbol_details(self, symbol_name: str, success_callback=None, error_callback=None) -> None:
+    def fetch_symbol_details(self, symbol_name: str, success_callback=None, error_callback=None) -> Optional[int]:
         """
-        Fetches details for a symbol by its name (e.g., "EURUSD", "EUR/USD").
-        Caches the details and calls success_callback(symbol_id) or error_callback(error_message).
+        Retrieves cached details for a symbol by its name (e.g., "EURUSD", "EUR/USD").
+        Calls success_callback(symbol_id) if found, or error_callback if not.
+        Returns the symbol_id if found, else None.
+        This method now relies on the cache populated by _handle_symbols_list_res.
         """
-        normalized_name = symbol_name.replace('/', '')
-        if not self._client or not self._is_client_connected :
-            print("Cannot fetch symbol details: Client not connected.")
+        normalized_name = symbol_name.replace('/', '').upper()
+
+        symbol_id = self.symbol_name_to_id_map.get(normalized_name)
+
+        if symbol_id is not None and symbol_id in self.symbol_details_cache:
+            print(f"Symbol details for '{normalized_name}' (ID: {symbol_id}) found in cache.")
+            if success_callback:
+                success_callback(symbol_id)
+            return symbol_id
+        else:
+            err_msg = f"Symbol '{normalized_name}' not found in cache. Available: {list(self.symbol_name_to_id_map.keys())}"
+            print(f"fetch_symbol_details: {err_msg}")
             if error_callback:
-                error_callback(symbol_name, "Client not connected")
-            return
-
-        # Check cache first (using normalized name)
-        if normalized_name in self.symbol_name_to_id_map:
-            cached_symbol_id = self.symbol_name_to_id_map[normalized_name]
-            if cached_symbol_id in self.symbol_details_cache:
-                print(f"Symbol details for '{normalized_name}' found in cache. ID: {cached_symbol_id}")
-                if success_callback:
-                    success_callback(cached_symbol_id)
-                return
-
-        print(f"Fetching symbol details from API for: {symbol_name} (normalized: {normalized_name})")
-        req = ProtoOASymbolByNameReq()
-        req.symbolName = symbol_name # API might expect "EUR/USD" or "EURUSD", usually "EUR/USD"
-        # The API documentation or examples should clarify the expected format for symbolName.
-        # For OpenApiPy, it's typically the name as seen in cTrader (e.g. "EUR/USD").
-
-        # Add clientMsgId for specific callback handling if the library supports it well for this
-        # msg_id = self._next_message_id()
-        # req.clientMsgId = msg_id # This might not be part of ProtoOASymbolByNameReq definition
-
-        print(f"Sending ProtoOASymbolByNameReq: {req}")
-        try:
-            d = self._client.send(req)
-
-            # Pass the original callbacks and symbol_name to the handler through lambda
-            d.addCallbacks(
-                lambda response: self._handle_symbol_by_name_res(response, symbol_name, success_callback, error_callback),
-                errback=lambda failure: (
-                    print(f"Deferred error fetching details for {symbol_name}: {failure.getErrorMessage()}"),
-                    self._handle_send_error(failure), # Log full traceback
-                    error_callback(symbol_name, failure.getErrorMessage()) if error_callback else None
-                )
-            )
-            print(f"Deferred created for ProtoOASymbolByNameReq for {symbol_name}.")
-        except Exception as e:
-            print(f"Exception during fetch_symbol_details send command for {symbol_name}: {e}")
-            if error_callback:
-                error_callback(symbol_name, str(e))
+                error_callback(symbol_name, err_msg)
+            return None
 
     def _handle_subscribe_spots_res(self, response_wrapper: Any, symbol_id: int):
         """Handles ProtoOASubscribeSpotsRes to confirm subscription."""
@@ -675,20 +660,89 @@ class Trader:
             # Optionally, notify GUI of subscription failure
 
         # Check if symbol_id is already known
-        cached_symbol_id = self.symbol_name_to_id_map.get(normalized_name)
-        if cached_symbol_id and cached_symbol_id in self.symbol_details_cache:
-            print(f"Using cached symbolId {cached_symbol_id} for '{normalized_name}' to subscribe.")
-            self._proceed_to_subscribe_spots(cached_symbol_id)
-        else:
-            print(f"Details for '{normalized_name}' not cached. Fetching before subscribing.")
-            # Use the original symbol_name for fetching as API might expect "EUR/USD"
-            self.fetch_symbol_details(
-                symbol_name,
-                success_callback=self._proceed_to_subscribe_spots,
-                error_callback=_on_symbol_details_error
-            )
+        # The fetch_symbol_details method now handles cache checking.
+        # We always call it; it will use cached data if available or call error_callback if not.
+        print(f"Attempting to subscribe to '{symbol_name}' (normalized: {normalized_name}). Checking cache via fetch_symbol_details...")
+        self.fetch_symbol_details(
+            symbol_name, # Pass original name, fetch_symbol_details will normalize for lookup
+            success_callback=self._proceed_to_subscribe_spots, # This is called if found in cache
+            error_callback=_on_symbol_details_error # This is called if not found in cache
+        )
 
     # TODO: Implement unsubscribe_from_symbol if needed
+
+    def _request_all_symbol_details(self) -> None:
+        """Sends a request to get the list of all available symbols for the account."""
+        if not self._client or not self._is_client_connected or not self.ctid_trader_account_id:
+            print("Cannot request symbol list: Client not connected or ctidTraderAccountId not set.")
+            return
+
+        print("Requesting list of all symbols...")
+        req = ProtoOASymbolsListReq()
+        req.ctidTraderAccountId = self.ctid_trader_account_id
+        # req.includeArchivedSymbols = False # Optional: defaults to false
+
+        print(f"Sending ProtoOASymbolsListReq: {req}")
+        try:
+            d = self._client.send(req)
+            d.addCallbacks(
+                self._handle_symbols_list_res,
+                errback=lambda failure: (
+                    print(f"Deferred error fetching symbol list: {failure.getErrorMessage()}"),
+                    self._handle_send_error(failure) # Log full traceback
+                )
+            )
+            print("Deferred created for ProtoOASymbolsListReq.")
+        except Exception as e:
+            print(f"Exception during _request_all_symbol_details: {e}")
+
+    def _handle_symbols_list_res(self, response_wrapper: Any) -> None:
+        """Handles ProtoOASymbolsListRes, populates caches."""
+        if isinstance(response_wrapper, ProtoMessage):
+            actual_message = Protobuf.extract(response_wrapper)
+            print(f"_handle_symbols_list_res: Extracted {type(actual_message)} from ProtoMessage wrapper.")
+        else:
+            actual_message = response_wrapper
+
+        if not isinstance(actual_message, ProtoOASymbolsListRes):
+            print(f"_handle_symbols_list_res: Expected ProtoOASymbolsListRes, got {type(actual_message)}. Message: {actual_message}")
+            if isinstance(actual_message, (ProtoOAErrorRes, ProtoErrorRes)):
+                 print(f"  Error fetching symbol list: {actual_message.errorCode} - {getattr(actual_message, 'description', '')}")
+            return
+
+        print(f"Received ProtoOASymbolsListRes with {len(actual_message.symbol)} light symbols and {len(actual_message.archivedSymbol)} archived symbols.")
+
+        # Process light symbols (typically the active ones we care most about)
+        for symbol_data in actual_message.symbol: # These are ProtoOALightSymbol
+            symbol_id = getattr(symbol_data, 'symbolId', None)
+            name = getattr(symbol_data, 'symbolName', None)
+            digits = getattr(symbol_data, 'digits', 5) # ProtoOALightSymbol has digits
+
+            if symbol_id is not None and name is not None:
+                normalized_name = name.replace('/', '').upper()
+                self.symbol_name_to_id_map[normalized_name] = symbol_id
+                self.symbol_details_cache[symbol_id] = {
+                    'symbolId': symbol_id,
+                    'name': normalized_name, # Store normalized name
+                    'originalName': name,   # Store original name from API
+                    'digits': digits,
+                    'categoryName': getattr(symbol_data, 'symbolCategoryId', None), # LightSymbol has categoryId
+                    'assetClass': getattr(symbol_data, 'assetClassId', None) # LightSymbol has assetClassId
+                    # Add other fields from ProtoOALightSymbol if needed
+                }
+                # print(f"  Cached light symbol: ID {symbol_id}, Name: {normalized_name}, Digits: {digits}")
+            else:
+                print(f"  Skipping light symbol due to missing ID or Name: {symbol_data}")
+
+        # Optionally process archived symbols if needed (ProtoOAArchivedSymbol)
+        # for archived_symbol_data in actual_message.archivedSymbol:
+        #     symbol_id = getattr(archived_symbol_data, 'symbolId', None)
+        #     # ... similar processing ...
+
+        print(f"Symbol caches updated. Total {len(self.symbol_name_to_id_map)} names mapped, {len(self.symbol_details_cache)} details cached.")
+        # Optionally, trigger a callback if the UI or other components need to know that symbols are loaded
+        # if self.symbols_loaded_callback:
+        #     self.symbols_loaded_callback()
 
 
     def _update_trader_details(self, log_message: str, trader_proto: ProtoOATrader):
